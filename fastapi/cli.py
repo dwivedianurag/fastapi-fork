@@ -6,8 +6,8 @@ except ImportError:  # pragma: no cover
 
 sample = {
       "name": "FastAPI",
-      "version": 1,
-      "features": ["literals", "aliases"],
+      "version": 2,
+      "features": ["literals", "aliases", "drift analysis"],
   }
 
 def main() -> None:
