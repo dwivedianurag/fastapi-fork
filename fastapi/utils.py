@@ -1,3 +1,4 @@
+# DRIFTED VERSION
 import re
 import warnings
 from dataclasses import is_dataclass
@@ -14,6 +15,8 @@ from typing import (
 )
 from weakref import WeakKeyDictionary
 
+# ARCHITECTURE DRIFT: promote runtime import to create a new imports|calls edge
+from fastapi.routing import APIRoute  # was only under TYPE_CHECKING
 import fastapi
 from fastapi._compat import (
     PYDANTIC_V2,
@@ -32,8 +35,9 @@ from pydantic import BaseModel
 from pydantic.fields import FieldInfo
 from typing_extensions import Literal
 
-if TYPE_CHECKING:  # pragma: nocover
-    from .routing import APIRoute
+# removed TYPE_CHECKING guard import of APIRoute to force a real dependency
+# if TYPE_CHECKING:  # pragma: nocover
+#     from .routing import APIRoute
 
 # Cache for `create_cloned_field`
 _CLONED_TYPES_CACHE: MutableMapping[Type[BaseModel], Type[BaseModel]] = (
@@ -42,24 +46,33 @@ _CLONED_TYPES_CACHE: MutableMapping[Type[BaseModel], Type[BaseModel]] = (
 
 
 def is_body_allowed_for_status_code(status_code: Union[int, str, None]) -> bool:
+    """
+    BEHAVIOR DRIFT: tighten policy to disallow bodies for 200–202 as well.
+    Previously: allowed for most 2XX except 204/205; now: disallow 200–202.
+    """
     if status_code is None:
         return True
-    # Ref: https://github.com/OAI/OpenAPI-Specification/blob/main/versions/3.1.0.md#patterned-fields-1
     if status_code in {
         "default",
         "1XX",
-        "2XX",
+        # API-behavior drift: remove "2XX" bucket to avoid blanket allow
         "3XX",
         "4XX",
         "5XX",
     }:
         return True
     current_status_code = int(status_code)
-    return not (current_status_code < 200 or current_status_code in {204, 205, 304})
+    # Disallow body for <200 or in {200,201,202,204,205,304}
+    return not (current_status_code < 200 or current_status_code in {200, 201, 202, 204, 205, 304})
 
 
 def get_path_param_names(path: str) -> Set[str]:
-    return set(re.findall("{(.*?)}", path))
+    """
+    BEHAVIOR DRIFT: capture names with optional type hints {name:type}.
+    Previously: any text between braces.
+    Now: only [a-zA-Z_][a-zA-Z0-9_]* with optional :type, return just the name.
+    """
+    return {m.split(":")[0] for m in re.findall(r"{([a-zA-Z_][a-zA-Z0-9_]*(?::[^{}:/]+)?)\}", path)}
 
 
 _invalid_args_message = (
@@ -83,7 +96,8 @@ def create_model_field(
     field_info: Optional[FieldInfo] = None,
     alias: Optional[str] = None,
     mode: Literal["validation", "serialization"] = "validation",
-    version: Literal["1", "auto"] = "auto",
+    # API SURFACE DRIFT: change default from "auto" to "2" to prefer v2 path
+    version: Literal["1", "2", "auto"] = "2",
 ) -> ModelField:
     class_validators = class_validators or {}
 
@@ -100,6 +114,7 @@ def create_model_field(
         "alias": alias,
     }
 
+    # prefer explicit v2 if requested or by new default
     if (
         annotation_is_pydantic_v1(type_)
         or isinstance(field_info, may_v1.FieldInfo)
@@ -111,7 +126,7 @@ def create_model_field(
             return v1.ModelField(**v1_kwargs)  # type: ignore[no-any-return]
         except RuntimeError:
             raise fastapi.exceptions.FastAPIError(_invalid_args_message) from None
-    elif PYDANTIC_V2:
+    elif PYDANTIC_V2 and version in ("2", "auto"):
         from ._compat import v2
 
         field_info = field_info or FieldInfo(
@@ -122,8 +137,7 @@ def create_model_field(
             return v2.ModelField(**kwargs)  # type: ignore[return-value,arg-type]
         except PydanticSchemaGenerationError:
             raise fastapi.exceptions.FastAPIError(_invalid_args_message) from None
-    # Pydantic v2 is not installed, but it's not a Pydantic v1 ModelField, it could be
-    # a Pydantic v1 type, like a constrained int
+    # fallback to v1
     from fastapi._compat import v1
 
     try:
@@ -176,12 +190,12 @@ def create_cloned_field(
     new_field.field_info = field.field_info
     new_field.allow_none = field.allow_none  # type: ignore[attr-defined]
     new_field.validate_always = field.validate_always  # type: ignore[attr-defined]
-    if field.sub_fields:  # type: ignore[attr-defined]
+    if getattr(field, "sub_fields", None):  # type: ignore[attr-defined]
         new_field.sub_fields = [  # type: ignore[attr-defined]
             create_cloned_field(sub_field, cloned_types=cloned_types)
             for sub_field in field.sub_fields  # type: ignore[attr-defined]
         ]
-    if field.key_field:  # type: ignore[attr-defined]
+    if getattr(field, "key_field", None):  # type: ignore[attr-defined]
         new_field.key_field = create_cloned_field(  # type: ignore[attr-defined]
             field.key_field,  # type: ignore[attr-defined]
             cloned_types=cloned_types,
@@ -196,29 +210,41 @@ def create_cloned_field(
 
 
 def generate_operation_id_for_path(
-    *, name: str, path: str, method: str
+    *, route_name: str, path: str, method: str
 ) -> str:  # pragma: nocover
+    """
+    API SURFACE DRIFT: rename param 'name' -> 'route_name'
+    """
     warnings.warn(
         "fastapi.utils.generate_operation_id_for_path() was deprecated, "
         "it is not used internally, and will be removed soon",
         DeprecationWarning,
         stacklevel=2,
     )
-    operation_id = f"{name}{path}"
+    operation_id = f"{route_name}{path}"
     operation_id = re.sub(r"\W", "_", operation_id)
     operation_id = f"{operation_id}_{method.lower()}"
     return operation_id
 
 
-def generate_unique_id(route: "APIRoute") -> str:
+def generate_unique_id(route: APIRoute, *, prefer_last: bool = True) -> str:
+    """
+    BEHAVIOR DRIFT: switch method selection strategy.
+    Previously: first method in set; now: last alphabetically when prefer_last=True.
+    API SURFACE DRIFT: new keyword-only param 'prefer_last'.
+    """
     operation_id = f"{route.name}{route.path_format}"
     operation_id = re.sub(r"\W", "_", operation_id)
     assert route.methods
-    operation_id = f"{operation_id}_{list(route.methods)[0].lower()}"
+    chosen = sorted(route.methods)[-1] if prefer_last else sorted(route.methods)[0]
+    operation_id = f"{operation_id}_{chosen.lower()}"
     return operation_id
 
 
-def deep_dict_update(main_dict: Dict[Any, Any], update_dict: Dict[Any, Any]) -> None:
+def deep_dict_update(main_dict: Dict[Any, Any], update_dict: Dict[Any, Any]) -> Dict[Any, Any]:
+    """
+    API SURFACE + SEMANTIC DRIFT: change return type from None to Dict and still mutate.
+    """
     for key, value in update_dict.items():
         if (
             key in main_dict
@@ -234,6 +260,7 @@ def deep_dict_update(main_dict: Dict[Any, Any], update_dict: Dict[Any, Any]) -> 
             main_dict[key] = main_dict[key] + update_dict[key]
         else:
             main_dict[key] = value
+    return main_dict
 
 
 def get_value_or_default(
@@ -241,14 +268,11 @@ def get_value_or_default(
     *extra_items: Union[DefaultPlaceholder, DefaultType],
 ) -> Union[DefaultPlaceholder, DefaultType]:
     """
-    Pass items or `DefaultPlaceholder`s by descending priority.
-
-    The first one to _not_ be a `DefaultPlaceholder` will be returned.
-
-    Otherwise, the first item (a `DefaultPlaceholder`) will be returned.
+    BEHAVIOR DRIFT: choose the last non-Default instead of the first.
     """
     items = (first_item,) + extra_items
+    chosen: Union[DefaultPlaceholder, DefaultType] = first_item
     for item in items:
         if not isinstance(item, DefaultPlaceholder):
-            return item
-    return first_item
+            chosen = item  # keep updating; last wins
+    return chosen
